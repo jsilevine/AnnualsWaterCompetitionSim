@@ -1,0 +1,566 @@
+#+TITLE: Relaxing the step-function approximation for plant growth under water limitation
+#+SUBTITLE: By Jacob Levine
+#+AUTHOR: Jacob Levine
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="rethink.css" />
+#+OPTIONS: num:nil html-style:nil toc:nil
+
+
+
+Here we will test whether coexistence in the model is robust to the relaxation of the step-function approximation for growth under limited water. To do so, we simulate the dynamics rather than using an analytical approach as the system is no longer tractable with variable within-season growth rates. Instead of assuming plants grow at a constant rate until reaching their shutoff water potential, we now calculate each species' growth rate at each point in time within a season as a function of soil water potential as outlined in Appendix 1.2.
+
+* 1. Setup
+
+*** 1.1 Utility functions
+
+First we load required packages and define several utility functions:
+
+#+BEGIN_SRC R :session :results none
+
+## load packages
+library(rootSolve)
+library(ggplot2)
+source("plot_utility.R")
+
+## calculate soil water content, W, from soil water
+## potential (see App. Eq. 7)
+calc_W <- function(psi_s, Wmax = 0.6, Wmin = 0.01, lambda = 4, psi_max = -0.05) {
+
+  Wscale <- Wmax - Wmin
+
+  W <- ( ( ( psi_max / psi_s ) ^ (1/lambda) ) * Wscale ) + Wmin
+
+  return(W)
+
+}
+
+## calculate soil water potential, psi, from soil water
+## content, W (see App. Eq. 7)
+calc_psi <- function(W, Wmax = 0.6, Wmin = 0.01, lambda = 4, psi_max = -0.05) {
+
+  Wscale <- Wmax - Wmin
+
+  psi <- psi_max * (Wscale / (W - Wmin))^lambda
+
+  return(psi)
+
+}
+
+
+## calculate phi (collection of constants, see equation 2 from man.) from
+## parameters
+calc_phi <- function() {
+
+  phi <- m / ((C_a - Gamma) * (1 + (D_s / D_0)))
+  return(phi)
+
+}
+
+## calculate a_m, the maximum carbon accumulation rate (minus leaf
+## respiration) per unit leaf area
+calc_a_m <- function(Vmax = 1.054545) {
+
+  phi <- calc_phi()
+
+  c_i <- C_a - (1 / phi)
+
+  a_m <- ((Vmax * c_i) / (omega + c_i)) - rl
+
+  return(a_m)
+
+}
+
+## function to calculate a
+calc_a <- function(psi_s, psi_0, Vmax = 1.054545) {
+
+  afun <- function(a) {
+
+    ((a * (Vmax - rl - a)) / (((gamma * k) / D_s) * ((C_a * (Vmax - rl - a)) -
+                             (omega * (a + rl))))) - (psi_s - psi_0)
+
+  }
+
+  ## solve for a
+  a <- min(uniroot.all(afun, c(0, 1), tol = 1e-5))
+
+  return(a)
+
+}
+
+
+## function to calculate G
+calc_G <- function(a, delta = 1) {
+
+  G <- ((nu - 1)/nu) * ((a - gamma * rr)/(delta))
+  return(G)
+
+}
+
+## calculate psi_star, the value of psi_soil at which
+## psi_leaf first reaches the critical value (see App. Eq. 5)
+calc_psi_star <- function(psi_0 = -1.5, Vmax = 1.054545) {
+
+  phi <- calc_phi()
+
+  a_m <- calc_a_m(Vmax = Vmax)
+
+  psi_star <- (( phi * a_m * D_s) / (gamma * k)) + psi_0
+
+  return(psi_star)
+
+}
+
+#+END_SRC
+
+*** 1.2 Single season simulator
+
+Next we define a function to simulate growth within a single season from each
+species' minimum soil water content, =psi_0=, maximum light accumulation rate,
+=Vmax=, population density, =N=, and the initial water content of the soil, =W=.
+
+#+BEGIN_SRC R :session :results none
+
+## function to simulate single year
+simulate_year <- function(W0, dt = 0.25, psi_0, Vmax, N, evap = 0) {
+
+  ## calculate initial soil water potential
+  psi_init <- calc_psi(W0)
+
+  Bdata <- data.frame(t = 0, psi_s = psi_init, W = W0)
+  B <- as.data.frame(t(as.matrix(rep(0, times = length(psi_0)), nrow = 1)))
+  colnames(B) <- as.character(seq(1, length(B)))
+  Bdata <- cbind(Bdata, B)
+
+  ## generate data frame of species characteristics
+  Sdata <- data.frame(spp = as.character(seq(1, length(N))),
+                      psi_0 = psi_0,
+                      N = N,
+                      Vmax = Vmax,
+                      a_m = sapply(Vmax, FUN = calc_a_m),
+                      psi_star = mapply(psi_0, Vmax, FUN = calc_psi_star))
+
+  ## indicator variable
+  i <- 1
+
+  ## continue looping until latest phenology species is out of water
+  while (Bdata[i, "psi_s"] > min(Sdata$psi_0)) {
+
+    a <- rep(0, times = nrow(Sdata))
+
+    if (any(Bdata[i, "psi_s"] < Sdata$psi_0)) {
+      a[Bdata[i, "psi_s"] < Sdata$psi_0] <- 0
+    }
+
+    ## calculate vector of carbon accumulations
+    if (any(Bdata[i, "psi_s"] < Sdata$psi_star & Bdata[i, "psi_s"] > Sdata$psi_0)) {
+      a[Bdata[i, "psi_s"] < Sdata$psi_star & Bdata[i, "psi_s"] > Sdata$psi_0] <-
+        mapply(Sdata[Bdata[i, "psi_s"] < Sdata$psi_star & Bdata[i, "psi_s"] > Sdata$psi_0, "psi_0"],
+               Sdata[Bdata[i, "psi_s"] < Sdata$psi_star & Bdata[i, "psi_s"] > Sdata$psi_0, "Vmax"],
+               FUN = calc_a, psi_s = Bdata[i, "psi_s"])
+    }
+
+    ## if psi_s > psi_star, a = a_m
+    if (any(Bdata[i, "psi_s"] > Sdata$psi_star)) {
+      a[Bdata[i, "psi_s"] > Sdata$psi_star] <-
+        Sdata[Bdata[i, "psi_s"] > Sdata$psi_star, "a_m"]
+    }
+
+    ## truncate at 0 to prevent negative growth
+    a[a <= 0] <- 0
+
+    ## calculate growth rates
+    G <- sapply(a, FUN = calc_G)
+    G[G <= 0] <- 0
+
+    ## impose some cutoff to reduce simulation time, should make almost no difference.
+    ## This is biologically reasonable given Beta shutoff operator
+    if (all(G <= 1e-2)) break
+
+    G_B <- G^(nu/(nu-1))
+    G_L <- G^(1/(nu-1))
+
+    dtau <- (Bdata[i, "t"] + dt)^(nu/(nu-1)) - Bdata[i, "t"]^(nu/(nu-1))
+
+    nB <- Bdata[i, as.character(seq(1, nrow(Sdata)))] + (G_B * dtau)
+    colnames(nB) <- as.character(seq(1, nrow(Sdata)))
+
+    ## transpire water
+    E <- 1e-2 * ((nu-1)/nu) * sum((Sdata[, "N"] * G_L)) * dtau
+
+    nW <- Bdata[i, "W"] - E
+
+    nW <- nW - (evap * nW)
+
+    npsi_s <- calc_psi(nW)
+
+    nBd <- data.frame(t = Bdata[nrow(Bdata), "t"] + dt,
+                         W = nW,
+                         psi_s = npsi_s)
+
+    nBd <- cbind(nBd, nB)
+
+    Bdata <- rbind(Bdata, nBd)
+    rownames(Bdata) <- NULL
+
+   i <- i + 1
+
+  }
+
+  return(list(Bdata, Bdata[i,]))
+
+}
+
+#+END_SRC
+
+*** 1.3 Cross-year simulator
+
+Now we define a function to simulate dynamics across years by repeatedly calling
+=simulate_year=. We want the dynamics to run to an equilibrium, or at least
+close to one, so we set a threshold on the between-year deltas. Here we
+designate the system is at equilibrium when the proportional change in
+population density in one timestep for each species is less than one
+one-hundredth of a percent, i.e. \(\frac{N_{T+1} - N_T}{N_T} < 0.0001\). We also
+specify a maximum number of timesteps to prevent the simulator from running
+forever.
+
+#+BEGIN_SRC R :session
+
+simulate_dynamics <- function(W0, dt = 0.01, Tmax = 1000, psi_0, Vmax, N0, F, evap = 0) {
+
+  ## set up data
+  data <- data.frame(T = 0)
+  data <- cbind(data, as.data.frame(matrix(N0, ncol = length(N0))))
+  colnames(data) <- c("T", as.character(seq(1, length(N0))))
+
+  equil <- FALSE
+  i <- 1
+  while (equil == FALSE) {
+
+    out <- simulate_year(W0 = W0, dt = dt, psi_0 = psi_0,
+                         Vmax = Vmax, N = as.numeric(data[i, 2:(length(N0)+1)]),
+                         evap = evap)[[2]]
+
+    ##browser()
+
+    ndata <- as.data.frame(c(i, out[,4:(3+length(N0))] * as.numeric(data[i, 2:(length(N0)+1)]) * F))
+    colnames(ndata) <- c("T", as.character(seq(1, length(N0))))
+
+    data <- rbind(data, ndata)
+
+    deltas <- abs((data[i+1, 2:(length(N0)+1)] - data[i, 2:(length(N0)+1)]) / data[i, 2:(length(N0)+1)])
+
+    if (all(deltas < 0.0001) | i > Tmax) equil <- TRUE
+    print(i)
+    print(deltas)
+
+    i <- i + 1
+
+  }
+
+  return(data)
+
+}
+
+
+#+END_SRC
+
+#+RESULTS:
+
+*** 1.4 Defining constants
+
+Next, we define appropriate values for the ecophysiological constants in the model. Here we choose k in order to maximize the "curviness" of the growth function in time. Though the value 0.05 may not be biologically reasonable, we choose it in order to present an especially extreme case to the simulator. This approach should allow us to see whether relaxing the assumption of step-function growth changes the qualitative results of the study.
+
+#+BEGIN_SRC R :session :results none
+
+## define constants
+nu <- 1.5       ## allometric constant
+k <- 0.05       ## xylem conductivity
+a_m <- 0.3      ## maximum rate of carbon accumulation
+Gamma <- 50     ##
+gamma <- 0.5    ## root shoot ratio
+rr <- 0.1       ## root respiration rate
+rl <- 0.2       ## leaf respiration rate
+C_a <- 400      ## atmospheric carbon concentration
+omega <- 450    ## empirical constant
+D_s <- 1.5       ## vapor pressure deficit
+D_0 <- 1.5       ## empirical constant
+m <- 5.6        ## empirical constant
+
+#+END_SRC
+
+* 2. Simulating a community with species evenly-spaced in break-even time
+
+Under the step-function approximation, coexistence is maintained when there is a negatively-sloped, concave up tradeoff between threshold soil water content and break-even time. Without the step-function approximation, the clean relationship between growth rate and time is broken as growth rate, \(G\), is now variable in time. To test the ability of the model to maintain coexistence without the approximation, we still need to draw species from a tradeoff. One possibility is to still define a tradeoff between \(W_i^*\) and \(\tau_i^*\), where \(\tau_i^* = \frac{1}{FG_{max,i}^B}\). Here \(G_{max,i}^B\) is the maximum biomass growth rate of species \(i\), i.e. \(G_{max,i}^B = F(a_{m})\). If we assume this relatinoship, we can still draw species from a tradeoff between \(W_i^*\) and \(\tau_i^*\), then back-calculate the value of \(V_{max}\) that corresponds to \(G_{max,i}^B\).
+
+Though we can choose any functional form for the relationship between break-even time and threshold water content that has the correct characteristics, here we use a negative exponential, as it is simple to parameterize: \(W_i^*(\tau_i^*) = a e^{-b \tau_i^*} + c \). We choose \(a\), \(b\), and \(c\) to get a reasonable relationship between the parameters.
+
+*** 2.1 Choosing species
+
+We start by selecting species which are evenly spaced in break-even time, as this system will go to equilibrium faster than one in which species are drawn randomly (though we also test this case later on). We choose only 15 species as the simulations are computationally cumbersome, though this should help us determine whether coexistence remains common under the relaxed assumptions.
+
+#+BEGIN_SRC R :file figures/tauWplot.svg :session :results output graphics file :exports both
+
+tau <- seq(40, 400, length.out = 15)
+tau <- tau[order(tau)] ## order by break-even time
+W_tau <- function(tau) 0.3 * exp(-0.01*tau) + 0.2
+W <- W_tau(tau) ## calculate W
+plot(tau, W, pch = 19) ## check it out
+
+#+END_SRC
+
+#+RESULTS:
+[[file:figures/tauWplot.svg]]
+
+ The tradeoff appears reasonable. Now we back-calculate the \(V_{max}\) values for each of these species that will give us the correct relationship.
+
+#+BEGIN_SRC R :session :results output :exports both
+
+## calculate Gs from taus
+G_tau <- function(tau, F = 100) G <- 1/(((F*tau)^((nu-1)/nu)))
+G <- G_tau(tau)
+
+## calculate carbon accumulation from G
+a_G <- function(G, delta = 1) ((nu * delta * G)/(nu-1)) + (gamma * rr)
+a <- a_G(G)
+
+Vmax_a <- function(a) {
+
+  phi <- calc_phi()
+
+  c_i <- C_a - (1 / phi)
+
+  Vmax <- (a + rl) * ((omega + c_i)/c_i)
+
+  return(Vmax)
+
+}
+
+Vmax <- Vmax_a(a)
+psi_0 <- calc_psi(W)
+
+print(data.frame(Vmax = Vmax, psi_0 = psi_0, row.names = NULL))
+
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+        Vmax      psi_0
+1  1.1573324 -0.2589670
+2  1.0813445 -0.4251974
+3  1.0373296 -0.6540066
+4  1.0073384 -0.9448710
+5  0.9850471 -1.2878556
+6  0.9675507 -1.6653665
+7  0.9532934 -2.0560916
+8  0.9413529 -2.4393978
+9  0.9311416 -2.7986379
+10 0.9222639 -3.1226953
+11 0.9144422 -3.4059504
+12 0.9074746 -3.6472757
+13 0.9012102 -3.8486795
+14 0.8955334 -4.0140203
+15 0.8903541 -4.1479945
+#+end_example
+
+*** 2.2 Simulating the system
+
+now we simulate the dynamics and plot the results:
+
+#+BEGIN_SRC R :session :eval never
+
+evensim <- simulate_dynamics(W0 = 0.6, Tmax = 1000, psi_0 = psi_0, Vmax = Vmax,
+                          N0 = rep(5, length(Vmax)), F = 100, evap = 0)
+
+## re-structure data for plotting
+pdata_even <- evensim[,c(1,2)]
+colnames(pdata_even) <- c("T", "dens")
+pdata_even$spp <- "1"
+for(i in 2:length(Vmax)) {
+
+  ndata <- evensim[,c(1,(i+1))]
+  colnames(ndata) <- c("T", "dens")
+  ndata$spp <- as.character(i)
+  pdata_even <- rbind(pdata_even, ndata)
+
+}
+
+
+write.csv(pdata_even, "simulationoutputlong_even.csv")
+write.csv(evensim, "simulationoutputwide_even.csv")
+
+#+END_SRC
+
+#+BEGIN_SRC R :file figures/evensimplot.svg :session :results output graphics file :dir :exports both
+
+pdata_even <- read.csv("simulationoutputlong_even.csv", row.names = NULL)
+evensim <- read.csv("simulationoutputwide_even.csv", row.names = NULL)
+
+pdata_even <- pdata_even[,2:ncol(pdata_even)]
+evensim <- evensim[,2:ncol(evensim)]
+
+pdata_even$spp <- as.integer(pdata_even$spp)
+pdata_even$spp2 <- as.factor(pdata_even$spp)
+
+evensimplot <- ggplot(data = pdata_even, aes(x = T, y = log(dens), color = spp, fill = spp2)) +
+  geom_line(size = 1) +
+  xlab("time (years)") +
+  ylab("log(density)") +
+  scale_color_continuous(low = "#9ecae1", high = "#08519c", limits = c(0, 15), breaks = c(0, 15)) +
+  theme_jabo() +
+  scale_x_continuous(expand = c(0,0))
+
+evensimplot <- second_axis(evensimplot)
+evensimplot
+
+#+END_SRC
+
+#+RESULTS:
+[[file:figures/evensimplot.svg]]
+
+Here, all species have positive equilibrium densities, and are for the most part ordered by phenology, as they were in the model with the step-function approximation. The only exception appears to be the latest species, which has a higher than expected population density.
+
+So far there is no evidence that breaking the step-function approximation seriously erodes diversity in the model.
+
+*** 2.3 Examining the within-season dynamics
+
+We now examine the within-season dynamics of the system at equilibrium to ensure growth rate varied through time (i.e. the assumption was truly relaxed). To do so we simulate a single season using the "equilibrium" density values from the prior simulation:
+
+#+BEGIN_SRC R :file figures/eqsimplot.svg :session :results output graphics file :dir  :exports both
+
+
+nspp <- length(Vmax)
+yearsim <- simulate_year(W0 = 0.6, dt = 0.01, psi_0 = psi_0[1:nspp], Vmax = Vmax[1:nspp],
+                    N = as.numeric(evensim[nrow(evensim), 2:(nspp+1)]), evap = 0)[[1]]
+
+
+pydata <- yearsim[,c("t","1")]
+colnames(pydata) <- c("T", "B")
+pydata$spp <- "1"
+for(i in 2:nspp) {
+
+    ndata <- yearsim[,c(1,(i+3))]
+    colnames(ndata) <- c("T", "B")
+    ndata$spp <- as.character(i)
+    pydata <- rbind(pydata, ndata)
+
+}
+
+pydata$spp2 <- as.factor(pydata$spp)
+pydata$spp <- as.numeric(pydata$spp)
+
+pydata$dB <- NA
+
+for(i in 2:nrow(pydata)) {
+
+  pydata[i, "dB"] <- pydata[i, "B"] - pydata[i-1, "B"]
+
+}
+
+out <- ggplot(data = pydata[pydata$T > 0.01,], aes(x = T, y = B, color = spp, fill = spp2)) +
+  geom_line(size = 1) +
+  scale_color_continuous(low = "#9ecae1", high = "#08519c", limits = c(0, 15), breaks = c(0, 15)) +
+  theme_jabo() +
+  ylab("Biomass (kg)") +
+  xlab("time") +
+  scale_x_continuous(expand = c(0,0))
+
+out <- second_axis(out)
+out
+
+#+END_SRC
+
+#+RESULTS:
+[[file:figures/eqsimplot.svg]]
+
+Here we see that there is visible variation in growth rate towards the end of each species' growing season -- which results in lower overall growth per season than under a step-function approximation. However, the difference is slight even though we specifically chose parameter values to give us particularly high variability. This provides further support to the appropriateness of the approximation.
+
+Note also that at equilibrium all species finish the growing season at the same biomass. This is because we have chosen a constant fecundity proportion, \(F\), for all species. Therefore end of season biomass for an individual must be equal to \(1/F\) at equilibrium. We mainly did this for convenience of choosing species from a tradeoff. Variation in \(F\) will still end up in the calculation for \(\tau_i^*\) and the results unaffected.
+
+
+* 3. Simulating a community of species with randomly-drawn break-even times
+
+Next we simulate a community with species whose \(\tau_i^*\)'s are drawn at random.
+
+*** 3.1 Choosing species
+
+#+BEGIN_SRC R :file figures/wtaurand.svg :session :results output graphics file :exports both
+
+set.seed(18)
+tau <- runif(15, 40, 400)
+tau <- tau[order(tau)]
+W <- W_tau(tau)
+plot(tau, W, pch = 19) ## looks pretty good
+
+#+END_SRC
+
+#+RESULTS:
+[[file:figures/wtaurand.svg]]
+
+
+#+BEGIN_SRC R :session :results output :exports both
+
+## calculate Gs from taus
+G <- G_tau(tau)
+
+## calculate carbon accumulation from G
+a <- a_G(G)
+
+Vmax <- Vmax_a(a)
+psi_0 <- calc_psi(W)
+
+print(data.frame(Vmax = Vmax, psi_0 = psi_0, row.names = NULL))
+
+#+END_SRC
+
+*** 3.2 Simulating the system
+
+#+BEGIN_SRC R :session :eval never
+
+randsim <- simulate_dynamics(W0 = 0.6, Tmax = 2000, psi_0 = psi_0, Vmax = Vmax,
+                           N0 = rep(5, length(Vmax)), F = 100, evap = 0)
+
+#+END_SRC
+
+#+BEGIN_SRC R :session :eval never
+
+randpdata <- randsim[,c(1,2)]
+colnames(randpdata) <- c("T", "dens")
+randpdata$spp <- "1"
+for(i in 2:length(Vmax)) {
+
+  ndata <- randsim[,c(1,(i+1))]
+  colnames(ndata) <- c("T", "dens")
+  ndata$spp <- as.character(i)
+  randpdata <- rbind(randpdata, ndata)
+
+}
+
+write.csv(randpdata, "simulationoutputlong_rand.csv")
+write.csv(randsim, "simulationoutputwide_rand.csv")
+
+#+END_SRC
+
+#+BEGIN_SRC R :file figures/randsimplot.svg :session :results output graphics file :dir :exports both
+
+randpdata <- read.csv("simulationoutputlong_rand.csv")
+randsim <- read.csv("simulationoutputwide_rand.csv")
+
+randpdata$spp <- as.integer(randpdata$spp)
+randpdata$spp2 <- as.factor(randpdata$spp)
+
+
+ggplot(data = randpdata, aes(x = T, y = log(dens), color = spp, fill = spp2)) +
+  geom_line(size = 1) +
+  scale_color_continuous(low = "#9ecae1", high = "#08519c", limits = c(0, 15), breaks = c(0, 15)) +
+  theme_jabo() +
+  ylim(c(-5, NA)) +
+  scale_x_continuous(expand = c(0,0), limits = c(0, 1000))
+
+
+#+END_SRC
+
+#+RESULTS:
+[[file:figures/randsimplot.svg]]
+
+Here, all but one species reach a positive equilibrium population density. The one species that doesn't, species 2, never actually goes extinct in this simulation but decreases linearly in log space, indicating it is approaching 0 density.
+
+Though we do get an extinction in this case, the ability of 14 of 15 species to coexist indicates that coexistence in our simplified model is not dependent on the step-function approximation of plant growth under water limitation. We cannot of course test the ability of the un-approximated model to produce unlimited coexistence, though the ease at which 14 species coexist when drawn from a tradeoff similar to the one which allows unlimited coexistence in the approximated model suggests high diversity is still possible.

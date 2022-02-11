@@ -1,0 +1,14 @@
+#+TITLE: README - Annuals Water Competition Simulator (ACWS)
+#+AUTHOR: Jacob Levine
+
+* 1. Overview
+
+In this repository you will find code to simulate unapproximated growth and competition dynamics for Mediterannean annual plant species under water limitation. This simulator is based off the ecophysiological model in Levine et al. 2022, "Competition and coexistence in phenologically structured annual plant communities", presented primarily in Appendix 1. This simulator does not include the step-function approximation for growth under water limitation described in Appendix 1.3, but rather calculates plant growth rates explicitly at each time point in a growing season from soil water availability. This simulator can be used to explore the population dynamics of competing species and water availability dynamics within and across seasons.
+
+* 2. How to use this repository
+
+All of the functions necessary to use the simulator are contained in =simulator.R=. Specifically, the function =simulate_dynamics()= is used to simulate a system of species with user-specified characteristics across years. By default, the function runs until either a) the system reaches a quasi-equilibrium defined when each species' =delta= \(= \left|\frac{N_T - N_{T-1}}{N_{T-1}}\right|\) is less than a specified threshold, =delta_tol=, or b) the simulator runs for =Tmax= years. Both =delta_tol= and =Tmax= are user-supplied variables with default values of =0.0001= and =100= respectively.
+
+The function =simulate_year()= is used to simulate the dynamics within a single growing season, and is repeatedly called by =simulate_dynamics()=. In both functions, evaporation can be added through the variable =evap=. The user must specify a function to calculate evaporation at each within-season timestep. For example, if the user wishes evaporation to be proportional to current water availability they could write =evap = function(W) 0.01*W=.
+
+The file, =simulator_example.org=, contains annotated declarations of the functions and variables in =simulator.R= as well as scripts demonstrating how to use those functions to simulate a systems of plants. The examples are in fact the analyses performed in Appendix 9.3 of the manuscript, but serve the dual purpose of illustrating the use of the simulator. This file is a =.org= file, a form of markdown that integrates code and stylized annotations using [[https://orgmode.org/][Org Mode]]. This filetype is primarily supported by [[https://www.gnu.org/software/emacs/][GNU emacs]], of which I (Jacob) am a user. The code can be copied and run in RStudio or whatever your preferred IDE or text editor is (though you should consider switching to emacs).
